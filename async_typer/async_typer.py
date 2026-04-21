@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import logging
+import sys
 import warnings
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, TypeAlias, TypeVar, cast
@@ -12,6 +14,8 @@ from typing import Any, Literal, TypeAlias, TypeVar, cast
 import typer
 
 __all__ = ["AsyncTyper", "EventHandler", "EventType"]
+
+logger = logging.getLogger("async_typer")
 
 R = TypeVar("R")
 
@@ -153,11 +157,11 @@ class AsyncTyper(typer.Typer):
         @functools.wraps(async_func)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             with asyncio.Runner() as runner:
-                self._run_event_handlers(runner, "startup")
                 try:
+                    self._run_startup_handlers(runner)
                     return runner.run(async_func(*args, **kwargs))
                 finally:
-                    self._run_event_handlers(runner, "shutdown")
+                    self._run_shutdown_handlers(runner)
 
         return sync_wrapper
 
@@ -176,23 +180,57 @@ class AsyncTyper(typer.Typer):
             if not startup and not shutdown:
                 return func(*args, **kwargs)
             with asyncio.Runner() as runner:
-                self._run_event_handlers(runner, "startup")
                 try:
+                    self._run_startup_handlers(runner)
                     return func(*args, **kwargs)
                 finally:
-                    self._run_event_handlers(runner, "shutdown")
+                    self._run_shutdown_handlers(runner)
 
         return sync_wrapper
 
-    def _run_event_handlers(
-        self, runner: asyncio.Runner, event_type: EventType
-    ) -> None:
-        for handler in self._event_handlers[event_type]:
-            if inspect.iscoroutinefunction(handler):
-                runner.run(handler())
-            else:
-                result = handler()
-                # A plain callable may still return a coroutine (e.g. a lambda
-                # returning `foo()` where foo is async); await it on the loop.
-                if inspect.iscoroutine(result):
-                    runner.run(result)
+    def _run_startup_handlers(self, runner: asyncio.Runner) -> None:
+        """Run startup handlers in order; first failure aborts the rest."""
+        for handler in self._event_handlers["startup"]:
+            self._invoke_handler(runner, handler)
+
+    def _run_shutdown_handlers(self, runner: asyncio.Runner) -> None:
+        """Run every shutdown handler, preserving the primary exception.
+
+        The shutdown phase runs in a ``finally``, so a naive ``raise`` here
+        would overwrite whatever exception the command (or startup) is
+        propagating. Instead:
+
+        - if an exception is already in flight, shutdown errors are logged
+          and suppressed so the user sees the original failure;
+        - if nothing else went wrong, the first shutdown error is raised
+          after every remaining handler has had its turn;
+        - a second shutdown failure (after one is already captured) is
+          logged so it doesn't go silently, but doesn't replace the first.
+        """
+        primary_in_flight = sys.exc_info()[1] is not None
+        deferred_error: BaseException | None = None
+        for handler in self._event_handlers["shutdown"]:
+            try:
+                self._invoke_handler(runner, handler)
+            except BaseException as e:
+                if primary_in_flight or deferred_error is not None:
+                    logger.exception(
+                        "shutdown handler %r raised; suppressing to preserve "
+                        "the earlier exception",
+                        handler,
+                    )
+                else:
+                    deferred_error = e
+        if deferred_error is not None:
+            raise deferred_error
+
+    @staticmethod
+    def _invoke_handler(runner: asyncio.Runner, handler: EventHandler) -> None:
+        if inspect.iscoroutinefunction(handler):
+            runner.run(handler())
+        else:
+            result = handler()
+            # A plain callable may still return a coroutine (e.g. a lambda
+            # returning `foo()` where foo is async); await it on the loop.
+            if inspect.iscoroutine(result):
+                runner.run(result)
