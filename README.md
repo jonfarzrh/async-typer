@@ -1,42 +1,130 @@
 # async-typer
 
-`async-typer` is a _simple async wrapper_ for the [typer](https://github.com/tiangolo/typer) library. 
-We already have a lot of async implementations for our applications, but we can't use them easily with typer.
-With this simple wrapper, we can use async functions in CLI with typer-like interface.
-And `async-typer` have more features than typer to solve our real-world problems in a more elegant way.
+[Typer](https://github.com/tiangolo/typer) with first-class async support:
+`async def` commands and callbacks work alongside regular sync ones via the
+same `@app.command()` decorator — no second API to remember — plus lifecycle
+event handlers for setting up and tearing down async resources.
+
+## Features
+
+- **One decorator, sync or async** — `@app.command()` and `@app.callback()`
+  accept both regular and `async def` functions. The wrapper is transparent;
+  Typer's `--help`, option parsing, and type conversion all work as normal.
+- **Shared event loop across the command lifecycle** — startup handlers,
+  the command body, and shutdown handlers all run on the same
+  [`asyncio.Runner`](https://docs.python.org/3/library/asyncio-runner.html),
+  so async resources created on startup (connection pools, HTTP sessions,
+  etc.) remain usable by the command and by shutdown.
+- **Fully typed** — ships with a `py.typed` marker and strict type hints.
+- **Drop-in replacement** — re-exports Typer's public API, so
+  `from async_typer import Option, Argument, echo, ...` works without a
+  second import line.
 
 ## Installation
 
 ```bash
 pip install async-typer
+# or
+uv add async-typer
 ```
 
-## How to use
+Requires Python 3.11+.
+
+## Quick start
 
 ```python
 from async_typer import AsyncTyper
 
-
 app = AsyncTyper()
 
+
 @app.command()
-def foo():
-    service.work()
+def sync_hello(name: str = "world") -> None:
+    print(f"hi {name}")
 
-@app.async_command()
-async def bar():
-    await service.work_async()
 
+@app.command()
+async def async_hello(name: str = "world") -> None:
+    # await anything you need here
+    print(f"hello {name}")
+
+
+if __name__ == "__main__":
+    app()
 ```
 
-
-## FastAPI-like event handlers
-
-Handle startup and shutdown events with async or sync functions.
+## Async callbacks
 
 ```python
-app.add_event_handler("startup", redis_async_pool_manager.init_redis_pool)
-app.add_event_handler("shutdown", redis_async_pool_manager.close_redis_pool)
+@app.callback()
+async def main(verbose: bool = False) -> None:
+    if verbose:
+        print("verbose mode")
 ```
 
-Please check the [typer documentation](https://typer.tiangolo.com/) for more information.
+## Lifecycle event handlers
+
+Register `startup` and `shutdown` hooks, sync or async. They run on the
+same event loop as the command body, so shared async resources stay alive
+across the whole invocation:
+
+```python
+import httpx
+
+app = AsyncTyper()
+state: dict[str, httpx.AsyncClient] = {}
+
+
+async def open_client() -> None:
+    state["client"] = httpx.AsyncClient()
+
+
+async def close_client() -> None:
+    await state["client"].aclose()
+
+
+app.add_event_handler("startup", open_client)
+app.add_event_handler("shutdown", close_client)
+
+
+@app.command()
+async def fetch(url: str) -> None:
+    response = await state["client"].get(url)
+    print(response.status_code)
+```
+
+The shutdown handler runs even if the command raises — use it to release
+resources unconditionally.
+
+## Migrating from 0.1.x
+
+The separate `async_command` / `async_callback` decorators still work but
+emit `DeprecationWarning`. Replace them with the unified `command` /
+`callback`, which auto-detect `async def`:
+
+```python
+# before
+@app.async_command()
+async def foo(): ...
+
+# after
+@app.command()
+async def foo(): ...
+```
+
+## Development
+
+This repo uses [`uv`](https://github.com/astral-sh/uv),
+[`ruff`](https://github.com/astral-sh/ruff), and
+[`ty`](https://github.com/astral-sh/ty).
+
+```bash
+uv sync --dev
+uv run pytest
+uv run ruff check .
+uv run ty check
+```
+
+## License
+
+MIT — see [LICENSE.txt](LICENSE.txt).
